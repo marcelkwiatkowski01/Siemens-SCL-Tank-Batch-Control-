@@ -1,0 +1,234 @@
+//==============================================================================
+// Projekt zaliczeniowy - Zaawansowane PLC (SCL)
+// Sterowanie wsadowe zbiornikiem (Factory I/O: scena "Level Control")
+// Plik zrodlowy do importu: External source files -> Generate blocks from source
+//
+// Zawiera:
+//   FC "FcScaleLevel"  - skalowanie sygnalu analogowego (NORM_X / SCALE_X, RETURN)
+//   FB "FbTankBatch"   - logika sekwencji wsadowej (maszyna stanow)
+//
+// Wersja finalna: z przetrzymaniem spustu (DRAIN_HOLD), watchdogiem 60 s
+// oraz mocniejszym laniem pod setpointem.
+//==============================================================================
+
+
+//------------------------------------------------------------------------------
+// FUNKCJA POMOCNICZA: surowa wartosc analogowa -> jednostki inzynierskie [%]
+//------------------------------------------------------------------------------
+FUNCTION "FcScaleLevel" : Real
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      rawValue : Int;    // surowa wartosc z wejscia analogowego (WORD/Int)
+      rawMax : Int;      // zakres pelnej skali (np. 27648)
+      engMax : Real;     // gorny zakres inzynierski (np. 100.0 %)
+   END_VAR
+
+   VAR_TEMP
+      tempNorm : Real;   // wartosc znormalizowana 0.0 .. 1.0
+   END_VAR
+
+BEGIN
+   // Straz wejscia - jesli konfiguracja bledna, przerwij funkcje (RETURN)
+   IF #rawMax <= 0 THEN
+      #FcScaleLevel := 0.0;
+      RETURN;
+   END_IF;
+
+   #tempNorm := NORM_X(MIN := 0, MAX := #rawMax, VALUE := #rawValue);
+   #FcScaleLevel := SCALE_X(MIN := 0.0, MAX := #engMax, VALUE := #tempNorm);
+END_FUNCTION
+
+
+//------------------------------------------------------------------------------
+// BLOK FUNKCYJNY: sterowanie wsadowe (napelnianie -> przetrzymanie -> spust)
+//------------------------------------------------------------------------------
+FUNCTION_BLOCK "FbTankBatch"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      start : Bool;      // przycisk Start (Factory I/O)
+      stop : Bool;       // przycisk Stop
+      reset : Bool;      // przycisk Reset
+      levelRaw : Int;    // Level Meter - surowa wartosc analogowa
+   END_VAR
+
+   VAR_OUTPUT
+      fillValve : Int;   // Fill Valve - analogowe wyjscie 0..RAW_MAX
+      drainValve : Int;  // Discharge Valve - analogowe wyjscie 0..RAW_MAX
+      lampRun : Bool;    // lampka pracy
+      lampStop : Bool;   // lampka stanu spoczynku
+      lampAlarm : Bool;  // lampka alarmu
+   END_VAR
+
+   VAR
+      statState : Int;                   // stan maszyny: 0..5
+      statLevelPct : Real;               // przefiltrowany poziom [%]
+      statSetpoint : Real := 55.0;       // zadany poziom [%] - edytowalny online
+      statBatchCount : Int;              // liczba ukonczonych wsadow
+      statSampleIdx : Int;               // indeks bufora filtra
+      statSamples : Array[0..4] of Real; // bufor probek do sredniej kroczacej
+      instStartEdge : R_TRIG;            // detekcja zbocza przycisku Start
+      instStopEdge : R_TRIG;             // detekcja zbocza przycisku Stop
+      instFillTon : TON_TIME;            // watchdog czasu napelniania
+      instHoldTon : TON_TIME;            // czas przetrzymania / mieszania
+      instDrainTon : TON_TIME;           // przetrzymanie spustu (dopompowanie)
+      instBatchCtu : CTU_INT;            // licznik wsadow
+   END_VAR
+
+   VAR_TEMP
+      tempStartPulse : Bool;
+      tempStopPulse : Bool;
+      tempFillTimeout : Bool;
+      tempHoldDone : Bool;
+      tempDrainDone : Bool;
+      tempAllDone : Bool;
+      tempRunning : Bool;
+      tempI : Int;
+      tempSum : Real;
+      tempErr : Real;
+      tempCmd : Real;
+   END_VAR
+
+   VAR CONSTANT
+      KP : Real := 8.0;                // wzmocnienie czlonu P
+      RAW_MAX : Int := 27648;          // pelna skala analogu (Siemens)
+      LEVEL_MAX : Real := 100.0;       // gorny zakres poziomu [%]
+      SAMPLE_COUNT : Int := 5;         // liczba probek filtra
+      FILL_TIMEOUT : Time := T#60S;    // limit czasu napelniania
+      HOLD_TIME : Time := T#5S;        // czas przetrzymania
+      DRAIN_HOLD : Time := T#4S;       // dodatkowy czas spustu (dopompowanie)
+      BATCH_TARGET : Int := 3;         // ile wsadow ma wykonac
+      EMPTY_LEVEL : Real := 2.0;       // prog "zbiornik pusty" [%]
+   END_VAR
+
+BEGIN
+   //===========================================================================
+   // 1) DETEKCJA ZBOCZY na przyciskach Start / Stop
+   //===========================================================================
+   #instStartEdge(CLK := #start);
+   #tempStartPulse := #instStartEdge.Q;
+   #instStopEdge(CLK := #stop);
+   #tempStopPulse := #instStopEdge.Q;
+
+   //===========================================================================
+   // 2) SYGNAL ANALOGOWY: skalowanie (FC z NORM_X/SCALE_X) i zapis do bufora
+   //===========================================================================
+   #statSamples[#statSampleIdx] := "FcScaleLevel"(rawValue := #levelRaw,
+                                                  rawMax := #RAW_MAX,
+                                                  engMax := #LEVEL_MAX);
+   #statSampleIdx := #statSampleIdx + 1;
+   IF #statSampleIdx >= #SAMPLE_COUNT THEN
+      #statSampleIdx := 0;
+   END_IF;
+
+   //===========================================================================
+   // 3) PETLA FOR - srednia kroczaca (z instrukcjami CONTINUE oraz EXIT)
+   //===========================================================================
+   #tempSum := 0.0;
+   FOR #tempI := 0 TO #SAMPLE_COUNT - 1 DO
+      IF #statSamples[#tempI] < 0.0 THEN
+         CONTINUE;                  // pomin bledna probke, petla trwa dalej
+      END_IF;
+      IF #statSamples[#tempI] > 200.0 THEN
+         EXIT;                      // wartosc uszkodzona - przerwij petle
+      END_IF;
+      #tempSum := #tempSum + #statSamples[#tempI];
+   END_FOR;
+   #statLevelPct := #tempSum / INT_TO_REAL(#SAMPLE_COUNT);
+
+   //===========================================================================
+   // 4) TIMERY - wolane co cykl, wejscie IN zwiazane ze stanem (auto-reset)
+   //===========================================================================
+   #instFillTon(IN := (#statState = 1), PT := #FILL_TIMEOUT);
+   #tempFillTimeout := #instFillTon.Q;
+   #instHoldTon(IN := (#statState = 2), PT := #HOLD_TIME);
+   #tempHoldDone := #instHoldTon.Q;
+   #instDrainTon(IN := (#statState = 3) AND (#statLevelPct <= #EMPTY_LEVEL),
+                 PT := #DRAIN_HOLD);
+   #tempDrainDone := #instDrainTon.Q;
+
+   //===========================================================================
+   // 5) LICZNIK wsadow - zlicza wejscie w stan 4 (koniec wsadu)
+   //===========================================================================
+   #instBatchCtu(CU := (#statState = 4), R := #reset, PV := #BATCH_TARGET);
+   #statBatchCount := #instBatchCtu.CV;
+   #tempAllDone := (#statBatchCount >= #BATCH_TARGET);
+
+   //===========================================================================
+   // 6) STOP / RESET - nadrzedne (logika + zbocza + petla WHILE)
+   //===========================================================================
+   IF #tempStopPulse THEN
+      #statState := 0;
+   END_IF;
+   IF #reset THEN
+      #statState := 0;
+      #tempI := 0;
+      WHILE #tempI < #SAMPLE_COUNT DO      // czyszczenie bufora filtra
+         #statSamples[#tempI] := 0.0;
+         #tempI := #tempI + 1;
+      END_WHILE;
+   END_IF;
+
+   //===========================================================================
+   // 7) MASZYNA STANOW (CASE) - sekwencja wsadowa
+   //===========================================================================
+   CASE #statState OF
+      0:  // IDLE - oczekiwanie na Start
+         #fillValve := 0;
+         #drainValve := 0;
+         IF #tempStartPulse THEN
+            #statState := 1;
+         END_IF;
+
+      1:  // FILLING - proporcjonalne otwarcie zaworu (sterowanie analogowe)
+         #drainValve := 0;
+         #tempErr := #statSetpoint - #statLevelPct;   // arytmetyka: uchyb
+         #tempCmd := #tempErr * #KP;                   // czlon proporcjonalny
+         IF #tempCmd > 100.0 THEN                      // ograniczenie wyjscia
+            #tempCmd := 100.0;
+         ELSIF #tempCmd < 50.0 THEN                    // dolny prog - brisk fill
+            #tempCmd := 50.0;
+         END_IF;
+         #fillValve := REAL_TO_INT(#tempCmd / 100.0 * INT_TO_REAL(#RAW_MAX));
+         IF #statLevelPct >= #statSetpoint THEN
+            #statState := 2;
+         ELSIF #tempFillTimeout THEN
+            #statState := 5;                           // przekroczony czas -> ALARM
+         END_IF;
+
+      2:  // HOLDING - przetrzymanie / mieszanie
+         #fillValve := 0;
+         #drainValve := 0;
+         IF #tempHoldDone THEN
+            #statState := 3;
+         END_IF;
+
+      3:  // DRAINING - oproznianie (z dopompowaniem przez DRAIN_HOLD)
+         #fillValve := 0;
+         #drainValve := #RAW_MAX;
+         IF #tempDrainDone THEN
+            #statState := 4;
+         END_IF;
+
+      4:  // BATCH DONE - kolejny wsad czy koniec
+         #drainValve := 0;
+         IF #statBatchCount >= #BATCH_TARGET THEN
+            #statState := 0;                           // wszystkie wsady gotowe
+         ELSE
+            #statState := 1;                           // start kolejnego wsadu
+         END_IF;
+
+      ELSE:  // 5 = ALARM oraz kazdy inny nieoczekiwany stan (wymog Styleguide)
+         #fillValve := 0;
+         #drainValve := 0;
+   END_CASE;
+
+   //===========================================================================
+   // 8) SYGNALIZACJA - funkcje logiczne (AND / OR / NOT)
+   //===========================================================================
+   #tempRunning := (#statState = 1) OR (#statState = 2) OR (#statState = 3);
+   #lampRun := #tempRunning AND NOT #tempAllDone;
+   #lampStop := (#statState = 0);
+   #lampAlarm := (#statState = 5);
+END_FUNCTION_BLOCK
