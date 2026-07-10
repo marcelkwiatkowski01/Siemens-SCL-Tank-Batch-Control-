@@ -23,9 +23,7 @@ Built as a coursework project for *Advanced PLC*, it demonstrates a full set of 
 .
 ├── README.md
 ├── tia/
-│   ├── TankBatchControl.zap15_1     # archived TIA project (use Retrieve to restore)
-│   └── src/
-│       └── TankBatch.scl            # SCL source (FB + FC) — readable / importable
+│   └── TankBatchControl.zap15_1     # archived TIA project (use Retrieve to restore)
 └── factoryio/
     └── TankLevelControl.factoryio   # saved scene including the I/O mapping
 
